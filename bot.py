@@ -1,6 +1,6 @@
 import random
 import time
-from threading import Thread
+from threading import Lock, Thread
 
 import vk_api
 from flask import Flask, jsonify
@@ -23,13 +23,14 @@ from config import (
 )
 from dice import DiceResult, format_multiple_rolls, format_single_roll, roll
 from media import MediaManager
-from modules import EconomyManager
+from modules import EconomyManager, SiteAgentClient
 from quotes import QuoteManager
 from replies import ReplyManager
 from talents import TalentManager
 
 
 app = Flask(__name__)
+_vk_send_lock = Lock()
 bot_state = {
     "running": False,
     "started_at": time.time(),
@@ -38,6 +39,7 @@ bot_state = {
     "talents": 0,
     "players": 0,
     "active_event": False,
+    "agent_configured": False,
 }
 
 
@@ -58,6 +60,7 @@ def health():
         talents=bot_state["talents"],
         players=bot_state["players"],
         active_event=bot_state["active_event"],
+        agent_configured=bot_state["agent_configured"],
     )
 
 
@@ -81,7 +84,8 @@ def send_message(vk, peer_id: int, message: str = "", attachment=None) -> None:
     if attachment:
         params["attachment"] = attachment
 
-    vk.messages.send(**params)
+    with _vk_send_lock:
+        vk.messages.send(**params)
 
 
 def get_user_name(vk, user_id: int) -> str:
@@ -111,6 +115,10 @@ def make_help(quotes_count: int, talents_count: int) -> str:
         "📖 Таланты:\n"
         "[мгновенная реакция\n"
         "[таланты мгновенная\n\n"
+        "🤖 Агент сайта:\n"
+        "[найди ваш вопрос\n"
+        "[глубокий поиск ваш вопрос\n"
+        "[агент статус\n\n"
         "💰 Экономика:\n"
         "[баланс\n"
         "[жалование\n"
@@ -152,18 +160,21 @@ def main():
         salary_cooldown_seconds=SALARY_COOLDOWN_SECONDS,
         admin_ids=VK_ADMIN_IDS,
     )
+    site_agent = SiteAgentClient.from_env()
 
     bot_state["running"] = True
     bot_state["quotes"] = len(quotes)
     bot_state["triggers"] = len(replies)
     bot_state["talents"] = len(talents)
+    bot_state["agent_configured"] = site_agent.configured
 
     print(
         f"Кубятня {VERSION} запущена. "
         f"Цитат: {len(quotes)}. "
         f"Триггеров: {len(replies)}. "
         f"Талантов: {len(talents)}. "
-        f"Администраторов экономики: {len(VK_ADMIN_IDS)}.",
+        f"Администраторов экономики: {len(VK_ADMIN_IDS)}. "
+        f"Агент сайта: {'настроен' if site_agent.configured else 'не настроен'}.",
         flush=True,
     )
 
@@ -208,6 +219,19 @@ def main():
                     peer_id,
                     make_help(len(quotes), len(talents)),
                 )
+                continue
+
+            # Запрос к отдельному Render-агенту выполняется в фоновом потоке.
+            site_answer = site_agent.handle(
+                text=text,
+                on_result=lambda answer, target_peer=peer_id: send_message(
+                    vk,
+                    target_peer,
+                    answer,
+                ),
+            )
+            if site_answer is not None:
+                send_message(vk, peer_id, site_answer)
                 continue
 
             # Экономика обрабатывается отдельным модулем.
