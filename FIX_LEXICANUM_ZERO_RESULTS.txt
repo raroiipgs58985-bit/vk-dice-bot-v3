@@ -1,0 +1,11 @@
+ИСПРАВЛЕНИЕ НУЛЕВОГО ПОИСКА LEXICANUM
+
+Загрузите в корень репозитория vk-site-ai-agent все файлы из этого архива
+с заменой существующих. Затем дождитесь автоматического деплоя Render.
+
+В Environment агента проверьте:
+MEDIAWIKI_API_URL=https://wh40k.lexicanum.com/mediawiki/
+JINA_READER_FALLBACK=true
+
+Если MEDIAWIKI_API_URL заканчивается на api.php — замените значение.
+Основную Кубятню повторно обновлять не нужно.
