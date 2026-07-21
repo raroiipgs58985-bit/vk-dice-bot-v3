@@ -9,6 +9,9 @@ import psycopg
 from psycopg.rows import dict_row
 
 
+SCHEMA_VERSION = 2
+
+
 class EconomyDatabase:
     """PostgreSQL storage for balances, statistics, history and active bets."""
 
@@ -17,54 +20,99 @@ class EconomyDatabase:
         self.history_retention_days = max(7, int(history_retention_days))
         self.enabled = bool(self.url)
         self.last_cleanup_at = 0.0
+        self.schema_version = 0
 
         if self.enabled:
-            self._init_schema()
+            self._run_migrations()
             self.cleanup(force=True)
 
     def _connect(self):
         return psycopg.connect(self.url, autocommit=True, row_factory=dict_row)
 
-    def _init_schema(self) -> None:
+    def _run_migrations(self) -> None:
+        """Apply every missing migration exactly once, in numeric order."""
+        migrations: list[tuple[int, str, tuple[str, ...]]] = [
+            (
+                1,
+                "initial economy schema",
+                (
+                    """
+                    CREATE TABLE IF NOT EXISTS economy_players (
+                        vk_id BIGINT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        balance BIGINT NOT NULL DEFAULT 0,
+                        last_salary_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        bets_count BIGINT NOT NULL DEFAULT 0,
+                        wins BIGINT NOT NULL DEFAULT 0,
+                        losses BIGINT NOT NULL DEFAULT 0,
+                        total_bet BIGINT NOT NULL DEFAULT 0,
+                        total_won BIGINT NOT NULL DEFAULT 0,
+                        total_lost BIGINT NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS economy_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        vk_id BIGINT NOT NULL REFERENCES economy_players(vk_id) ON DELETE CASCADE,
+                        entry TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS economy_state (
+                        key TEXT PRIMARY KEY,
+                        value JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """,
+                ),
+            ),
+            (
+                2,
+                "economy indexes and data guards",
+                (
+                    "CREATE INDEX IF NOT EXISTS economy_history_vk_id_idx ON economy_history(vk_id, created_at DESC)",
+                    "CREATE INDEX IF NOT EXISTS economy_players_balance_idx ON economy_players(balance DESC)",
+                    "ALTER TABLE economy_players DROP CONSTRAINT IF EXISTS economy_players_balance_nonnegative",
+                    "ALTER TABLE economy_players ADD CONSTRAINT economy_players_balance_nonnegative CHECK (balance >= 0) NOT VALID",
+                    "ALTER TABLE economy_players VALIDATE CONSTRAINT economy_players_balance_nonnegative",
+                ),
+            ),
+        ]
+
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS economy_players (
-                    vk_id BIGINT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
-                    balance BIGINT NOT NULL DEFAULT 0,
-                    last_salary_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-                    bets_count BIGINT NOT NULL DEFAULT 0,
-                    wins BIGINT NOT NULL DEFAULT 0,
-                    losses BIGINT NOT NULL DEFAULT 0,
-                    total_bet BIGINT NOT NULL DEFAULT 0,
-                    total_won BIGINT NOT NULL DEFAULT 0,
-                    total_lost BIGINT NOT NULL DEFAULT 0,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """
             )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS economy_history (
-                    id BIGSERIAL PRIMARY KEY,
-                    vk_id BIGINT NOT NULL REFERENCES economy_players(vk_id) ON DELETE CASCADE,
-                    entry TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS economy_history_vk_id_idx ON economy_history(vk_id, created_at DESC)"
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS economy_state (
-                    key TEXT PRIMARY KEY,
-                    value JSONB NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
+            cur.execute("SELECT version FROM schema_migrations")
+            applied = {int(row["version"]) for row in cur.fetchall()}
+
+            for version, name, statements in migrations:
+                if version in applied:
+                    continue
+                with conn.transaction():
+                    for statement in statements:
+                        cur.execute(statement)
+                    cur.execute(
+                        "INSERT INTO schema_migrations (version, name) VALUES (%s, %s)",
+                        (version, name),
+                    )
+                print(f"Миграция БД {version} применена: {name}", flush=True)
+
+            cur.execute("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
+            row = cur.fetchone()
+            self.schema_version = int(row["version"] if row else 0)
+
+        if self.schema_version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Некорректная версия схемы БД: {self.schema_version}, ожидалась {SCHEMA_VERSION}"
             )
 
     def load_players(self) -> list[dict[str, Any]]:
