@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .database import EconomyDatabase
+
 
 MENTION_RE = re.compile(r"\[id(\d+)\|[^\]]+\]", re.IGNORECASE)
 ID_RE = re.compile(r"\bid(\d+)\b", re.IGNORECASE)
@@ -63,9 +65,44 @@ class EconomyManager:
         self.salary_cooldown_seconds = max(1, int(salary_cooldown_seconds))
         self.admin_ids = set(admin_ids or set())
         self.history_limit = max(1, int(history_limit))
-
+        self.db = EconomyDatabase(history_retention_days=90)
         self.players: dict[int, Player] = {}
         self.event: BettingEvent | None = None
+        self._load_from_database()
+
+    def _load_from_database(self) -> None:
+        for row in self.db.load_players():
+            player = Player(
+                vk_id=int(row["vk_id"]),
+                name=str(row["name"]),
+                balance=int(row["balance"]),
+                last_salary_at=float(row["last_salary_at"]),
+                history=list(row.get("history", [])),
+                bets_count=int(row["bets_count"]),
+                wins=int(row["wins"]),
+                losses=int(row["losses"]),
+                total_bet=int(row["total_bet"]),
+                total_won=int(row["total_won"]),
+                total_lost=int(row["total_lost"]),
+            )
+            self.players[player.vk_id] = player
+
+        payload = self.db.load_event()
+        if payload:
+            event = BettingEvent(
+                title=str(payload.get("title", "Событие")),
+                outcomes=[str(x) for x in payload.get("outcomes", [])],
+                bets_open=bool(payload.get("bets_open", True)),
+            )
+            for item in payload.get("bets", []):
+                bet = Bet(
+                    user_id=int(item["user_id"]),
+                    outcome=str(item["outcome"]),
+                    amount=int(item["amount"]),
+                )
+                event.bets[bet.user_id] = bet
+            if len(event.outcomes) >= 2:
+                self.event = event
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admin_ids
@@ -73,22 +110,26 @@ class EconomyManager:
     def get_or_create_player(self, user_id: int, name: str) -> Player:
         player = self.players.get(user_id)
         if player is None:
-            player = Player(
-                vk_id=user_id,
-                name=name,
-                balance=self.starting_balance,
-            )
+            player = Player(user_id, name, self.starting_balance)
             self.players[user_id] = player
+            self.db.save_player(player)
             self._log(player, f"+{self.starting_balance} — стартовый капитал")
-        else:
+        elif player.name != name:
             player.name = name
+            self.db.save_player(player)
         return player
+
+    def _save(self, *players: Player) -> None:
+        for player in players:
+            self.db.save_player(player)
 
     def _log(self, player: Player, text: str) -> None:
         timestamp = time.strftime("%d.%m %H:%M", time.localtime())
-        player.history.append(f"{timestamp} — {text}")
+        entry = f"{timestamp} — {text}"
+        player.history.append(entry)
         if len(player.history) > self.history_limit:
             del player.history[:-self.history_limit]
+        self.db.add_history(player.vk_id, entry)
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -96,41 +137,29 @@ class EconomyManager:
 
     @staticmethod
     def _format_duration(seconds: int) -> str:
-        seconds = max(0, seconds)
-        hours, remainder = divmod(seconds, 3600)
+        hours, remainder = divmod(max(0, seconds), 3600)
         minutes, _ = divmod(remainder, 60)
-        if hours:
-            return f"{hours} ч. {minutes} мин."
-        return f"{minutes} мин."
+        return f"{hours} ч. {minutes} мин." if hours else f"{minutes} мин."
 
-    def _resolve_target_id(self, command_tail: str, message: dict[str, Any]) -> int | None:
-        mention = MENTION_RE.search(command_tail)
+    def _resolve_target_id(self, tail: str, message: dict[str, Any]) -> int | None:
+        mention = MENTION_RE.search(tail)
         if mention:
             return int(mention.group(1))
-
-        id_match = ID_RE.search(command_tail)
-        if id_match:
-            return int(id_match.group(1))
-
-        reply_message = message.get("reply_message")
-        if isinstance(reply_message, dict):
-            reply_user_id = reply_message.get("from_id")
-            if isinstance(reply_user_id, int) and reply_user_id > 0:
-                return reply_user_id
-
-        parts = command_tail.split()
-        for part in parts:
+        match = ID_RE.search(tail)
+        if match:
+            return int(match.group(1))
+        reply = message.get("reply_message")
+        if isinstance(reply, dict) and isinstance(reply.get("from_id"), int):
+            return int(reply["from_id"])
+        for part in tail.split():
             if part.isdigit() and len(part) >= 5:
                 return int(part)
-
         return None
 
     @staticmethod
     def _extract_last_amount(text: str) -> int | None:
-        numbers = NUMBER_RE.findall(text)
-        if not numbers:
-            return None
-        return int(numbers[-1])
+        values = NUMBER_RE.findall(text)
+        return int(values[-1]) if values else None
 
     @staticmethod
     def _find_outcome(event: BettingEvent, value: str) -> str | None:
@@ -139,37 +168,20 @@ class EconomyManager:
             index = int(value) - 1
             if 0 <= index < len(event.outcomes):
                 return event.outcomes[index]
-
         folded = value.casefold()
-        exact = [outcome for outcome in event.outcomes if outcome.casefold() == folded]
+        exact = [x for x in event.outcomes if x.casefold() == folded]
         if exact:
             return exact[0]
-
-        partial = [outcome for outcome in event.outcomes if folded in outcome.casefold()]
-        if len(partial) == 1:
-            return partial[0]
-
-        return None
+        partial = [x for x in event.outcomes if folded in x.casefold()]
+        return partial[0] if len(partial) == 1 else None
 
     def _admin_required(self, user_id: int) -> str | None:
         if self.is_admin(user_id):
             return None
-        if not self.admin_ids:
-            return (
-                "⛔ Администраторы экономики не настроены.\n"
-                "Добавьте VK_ADMIN_IDS в переменные окружения Render."
-            )
         return "⛔ Эта команда доступна только администраторам."
 
-    def handle(
-        self,
-        *,
-        text: str,
-        user_id: int,
-        user_name: str,
-        message: dict[str, Any],
-        vk: Any,
-    ) -> str | None:
+    def handle(self, *, text: str, user_id: int, user_name: str, message: dict[str, Any], vk: Any) -> str | None:
+        self.db.cleanup()
         lower = self._clean(text).casefold()
         player = self.get_or_create_player(user_id, user_name)
 
@@ -184,76 +196,32 @@ class EconomyManager:
             now = time.time()
             elapsed = now - player.last_salary_at
             if player.last_salary_at and elapsed < self.salary_cooldown_seconds:
-                wait = int(self.salary_cooldown_seconds - elapsed)
-                return (
-                    "⏳ Жалование уже получено.\n"
-                    f"Следующее начисление через {self._format_duration(wait)}"
-                )
-
+                return "⏳ Жалование уже получено.\nСледующее начисление через " + self._format_duration(int(self.salary_cooldown_seconds - elapsed))
             amount = random.randint(self.salary_min, self.salary_max)
             player.balance += amount
             player.last_salary_at = now
+            self._save(player)
             self._log(player, f"+{amount} — жалование")
-            return (
-                f"💰 Получено жалование: {amount} тронов.\n"
-                f"Баланс: {player.balance} тронов."
-            )
+            return f"💰 Получено жалование: {amount} тронов.\nБаланс: {player.balance} тронов."
 
-        if lower == "[топ":
-            if not self.players:
+        if lower in ("[топ", "[балансы"):
+            ranked = sorted(self.players.values(), key=lambda x: (-x.balance, x.name.casefold()))
+            if not ranked:
                 return "Игроков пока нет."
-            ranked = sorted(
-                self.players.values(),
-                key=lambda item: (-item.balance, item.name.casefold()),
-            )[:10]
-            lines = [
-                f"{index}. {item.name} — {item.balance}"
-                for index, item in enumerate(ranked, start=1)
-            ]
-            return "🏆 Богачи Империума\n\n" + "\n".join(lines)
+            limit = 10 if lower == "[топ" else 50
+            title = "🏆 Богачи Империума" if lower == "[топ" else "💰 Балансы игроков"
+            lines = [f"{i}. {x.name} — {x.balance}" if lower == "[топ" else f"{x.name} — {x.balance}" for i, x in enumerate(ranked[:limit], 1)]
+            return title + "\n\n" + "\n".join(lines)
 
-        if lower == "[балансы":
-            if not self.players:
-                return "Игроков пока нет."
-            ranked = sorted(
-                self.players.values(),
-                key=lambda item: (-item.balance, item.name.casefold()),
-            )
-            lines = [f"{item.name} — {item.balance}" for item in ranked[:50]]
-            suffix = ""
-            if len(ranked) > 50:
-                suffix = f"\n\nПоказано 50 из {len(ranked)} игроков."
-            return "💰 Балансы игроков\n\n" + "\n".join(lines) + suffix
-
-        if lower == "[банк" or lower == "[ставки":
+        if lower in ("[банк", "[ставки"):
             if self.event is None:
                 return "📭 Активного события нет."
-
-            counts = {
-                outcome: sum(
-                    1 for bet in self.event.bets.values()
-                    if bet.outcome == outcome
-                )
-                for outcome in self.event.outcomes
-            }
-            sums = {
-                outcome: sum(
-                    bet.amount for bet in self.event.bets.values()
-                    if bet.outcome == outcome
-                )
-                for outcome in self.event.outcomes
-            }
-            lines = [
-                f"{index}. {outcome} — {counts[outcome]} ставок, {sums[outcome]} тронов"
-                for index, outcome in enumerate(self.event.outcomes, start=1)
-            ]
+            lines = []
+            for i, outcome in enumerate(self.event.outcomes, 1):
+                bets = [x for x in self.event.bets.values() if x.outcome == outcome]
+                lines.append(f"{i}. {outcome} — {len(bets)} ставок, {sum(x.amount for x in bets)} тронов")
             status = "открыты" if self.event.bets_open else "закрыты"
-            return (
-                f"🎲 {self.event.title}\n"
-                f"Ставки: {status}\n"
-                f"Банк: {self.event.bank} тронов\n\n"
-                + "\n".join(lines)
-            )
+            return f"🎲 {self.event.title}\nСтавки: {status}\nБанк: {self.event.bank} тронов\n\n" + "\n".join(lines)
 
         if lower.startswith("[ставка "):
             if self.event is None:
@@ -262,44 +230,24 @@ class EconomyManager:
                 return "🔒 Приём ставок закрыт."
             if user_id in self.event.bets:
                 return "⚠ Вы уже сделали ставку на это событие."
-
             tail = self._clean(text[len("[ставка"):])
             parts = tail.split(maxsplit=1)
             if len(parts) != 2 or not parts[0].isdigit():
                 return "Формат: [ставка 25 Победа"
-
             amount = int(parts[0])
-            if amount <= 0:
-                return "Сумма ставки должна быть больше нуля."
-            if amount > player.balance:
-                return (
-                    f"Недостаточно тронов.\n"
-                    f"Ваш баланс: {player.balance}"
-                )
-
+            if amount <= 0 or amount > player.balance:
+                return f"Недостаточно тронов.\nВаш баланс: {player.balance}"
             outcome = self._find_outcome(self.event, parts[1])
             if outcome is None:
-                options = "\n".join(
-                    f"{index}. {item}"
-                    for index, item in enumerate(self.event.outcomes, start=1)
-                )
-                return "Не удалось определить исход.\n\n" + options
-
+                return "Не удалось определить исход."
             player.balance -= amount
             player.bets_count += 1
             player.total_bet += amount
-            self.event.bets[user_id] = Bet(
-                user_id=user_id,
-                outcome=outcome,
-                amount=amount,
-            )
+            self.event.bets[user_id] = Bet(user_id, outcome, amount)
+            self._save(player)
             self._log(player, f"-{amount} — ставка: {outcome}")
-            return (
-                "✅ Ставка принята.\n\n"
-                f"Исход: {outcome}\n"
-                f"Сумма: {amount} тронов\n"
-                f"Остаток: {player.balance} тронов"
-            )
+            self.db.save_event(self.event)
+            return f"✅ Ставка принята.\n\nИсход: {outcome}\nСумма: {amount} тронов\nОстаток: {player.balance} тронов"
 
         if lower.startswith("[событие "):
             denied = self._admin_required(user_id)
@@ -307,30 +255,22 @@ class EconomyManager:
                 return denied
             if self.event is not None:
                 return "⚠ Сначала завершите или отмените текущее событие."
-
-            raw = self._clean(text[len("[событие"):])
-            chunks = [chunk.strip() for chunk in raw.split("|") if chunk.strip()]
+            chunks = [x.strip() for x in self._clean(text[len("[событие"):]).split("|") if x.strip()]
             if len(chunks) < 3:
                 return "Формат: [событие Название | Победа | Поражение"
-
-            title, outcomes = chunks[0], chunks[1:]
-            unique: list[str] = []
-            seen: set[str] = set()
-            for outcome in outcomes:
+            title, raw_outcomes = chunks[0], chunks[1:]
+            outcomes = []
+            seen = set()
+            for outcome in raw_outcomes:
                 key = outcome.casefold()
                 if key not in seen:
                     seen.add(key)
-                    unique.append(outcome)
-
-            if len(unique) < 2:
+                    outcomes.append(outcome)
+            if len(outcomes) < 2:
                 return "Нужно указать минимум два разных исхода."
-
-            self.event = BettingEvent(title=title, outcomes=unique)
-            options = "\n".join(
-                f"{index}. {outcome}"
-                for index, outcome in enumerate(unique, start=1)
-            )
-            return f"📢 Создано событие:\n{title}\n\n{options}"
+            self.event = BettingEvent(title, outcomes)
+            self.db.save_event(self.event)
+            return f"📢 Создано событие:\n{title}\n\n" + "\n".join(f"{i}. {x}" for i, x in enumerate(outcomes, 1))
 
         if lower == "[закрыть ставки":
             denied = self._admin_required(user_id)
@@ -338,14 +278,9 @@ class EconomyManager:
                 return denied
             if self.event is None:
                 return "Активного события нет."
-            if not self.event.bets_open:
-                return "Ставки уже закрыты."
             self.event.bets_open = False
-            return (
-                f"🔒 Ставки закрыты.\n"
-                f"Событие: {self.event.title}\n"
-                f"Банк: {self.event.bank} тронов."
-            )
+            self.db.save_event(self.event)
+            return f"🔒 Ставки закрыты.\nСобытие: {self.event.title}\nБанк: {self.event.bank} тронов."
 
         if lower.startswith("[итог "):
             denied = self._admin_required(user_id)
@@ -353,153 +288,93 @@ class EconomyManager:
                 return denied
             if self.event is None:
                 return "Активного события нет."
-
-            raw_outcome = self._clean(text[len("[итог"):])
-            winning_outcome = self._find_outcome(self.event, raw_outcome)
-            if winning_outcome is None:
+            winning = self._find_outcome(self.event, self._clean(text[len("[итог"):]))
+            if winning is None:
                 return "Не удалось определить победивший исход."
-
             event = self.event
             bank = event.bank
-            winners = [
-                bet for bet in event.bets.values()
-                if bet.outcome == winning_outcome
-            ]
-
-            if not winners:
-                for bet in event.bets.values():
-                    loser = self.players.get(bet.user_id)
-                    if loser:
-                        loser.losses += 1
-                        loser.total_lost += bet.amount
-                self.event = None
-                return (
-                    f"🏁 Итог: {winning_outcome}\n"
-                    f"Победителей нет. Банк в {bank} тронов сгорает."
-                )
-
-            winner_stake = sum(bet.amount for bet in winners)
+            winners = [x for x in event.bets.values() if x.outcome == winning]
             payouts: dict[int, int] = {}
-            distributed = 0
-
-            for bet in winners:
-                payout = bank * bet.amount // winner_stake
-                payouts[bet.user_id] = payout
-                distributed += payout
-
-            remainder = bank - distributed
-            for bet in sorted(winners, key=lambda item: (-item.amount, item.user_id)):
-                if remainder <= 0:
-                    break
-                payouts[bet.user_id] += 1
-                remainder -= 1
-
-            result_lines: list[str] = []
-            winner_ids = {bet.user_id for bet in winners}
-
+            if winners:
+                winner_stake = sum(x.amount for x in winners)
+                distributed = 0
+                for bet in winners:
+                    payouts[bet.user_id] = bank * bet.amount // winner_stake
+                    distributed += payouts[bet.user_id]
+                remainder = bank - distributed
+                for bet in sorted(winners, key=lambda x: (-x.amount, x.user_id)):
+                    if remainder <= 0:
+                        break
+                    payouts[bet.user_id] += 1
+                    remainder -= 1
+            lines = []
+            winner_ids = {x.user_id for x in winners}
             for bet in event.bets.values():
                 current = self.players.get(bet.user_id)
-                if current is None:
+                if not current:
                     continue
-
                 if bet.user_id in winner_ids:
                     payout = payouts[bet.user_id]
                     current.balance += payout
                     current.wins += 1
                     current.total_won += payout
-                    self._log(
-                        current,
-                        f"+{payout} — выигрыш: {winning_outcome}",
-                    )
-                    result_lines.append(f"{current.name} — +{payout}")
+                    self._log(current, f"+{payout} — выигрыш: {winning}")
+                    lines.append(f"{current.name} — +{payout}")
                 else:
                     current.losses += 1
                     current.total_lost += bet.amount
-
+                self._save(current)
             self.event = None
-            return (
-                f"🏁 Итог: {winning_outcome}\n"
-                f"Банк: {bank} тронов\n\n"
-                + "\n".join(result_lines)
-            )
+            self.db.save_event(None)
+            if not winners:
+                return f"🏁 Итог: {winning}\nПобедителей нет. Банк в {bank} тронов сгорает."
+            return f"🏁 Итог: {winning}\nБанк: {bank} тронов\n\n" + "\n".join(lines)
 
-        if lower == "[отмена события" or lower == "[сброс ставок":
+        if lower in ("[отмена события", "[сброс ставок"):
             denied = self._admin_required(user_id)
             if denied:
                 return denied
             if self.event is None:
                 return "Активного события нет."
-
             refunded = 0
             for bet in self.event.bets.values():
                 current = self.players.get(bet.user_id)
                 if current:
                     current.balance += bet.amount
                     refunded += bet.amount
+                    self._save(current)
                     self._log(current, f"+{bet.amount} — возврат ставки")
-
             title = self.event.title
             self.event = None
-            return (
-                f"↩ Событие «{title}» отменено.\n"
-                f"Возвращено: {refunded} тронов."
-            )
+            self.db.save_event(None)
+            return f"↩ Событие «{title}» отменено.\nВозвращено: {refunded} тронов."
 
-        if lower.startswith("[выдать "):
-            denied = self._admin_required(user_id)
-            if denied:
-                return denied
-            tail = self._clean(text[len("[выдать"):])
-            target_id = self._resolve_target_id(tail, message)
-            amount = self._extract_last_amount(tail)
-            if target_id is None or amount is None:
-                return "Формат: [выдать @игрок 50 — или ответом на сообщение."
-            if amount <= 0:
-                return "Сумма должна быть больше нуля."
-
-            target_name = self._get_vk_name(vk, target_id)
-            target = self.get_or_create_player(target_id, target_name)
-            target.balance += amount
-            self._log(target, f"+{amount} — выдано администратором")
-            return f"✅ {target.name} получил {amount} тронов.\nБаланс: {target.balance}"
-
-        if lower.startswith("[забрать "):
-            denied = self._admin_required(user_id)
-            if denied:
-                return denied
-            tail = self._clean(text[len("[забрать"):])
-            target_id = self._resolve_target_id(tail, message)
-            amount = self._extract_last_amount(tail)
-            if target_id is None or amount is None:
-                return "Формат: [забрать @игрок 25 — или ответом на сообщение."
-            if amount <= 0:
-                return "Сумма должна быть больше нуля."
-
-            target_name = self._get_vk_name(vk, target_id)
-            target = self.get_or_create_player(target_id, target_name)
-            taken = min(amount, target.balance)
-            target.balance -= taken
-            self._log(target, f"-{taken} — изъято администратором")
-            return f"✅ У {target.name} изъято {taken} тронов.\nБаланс: {target.balance}"
-
-        if lower.startswith("[установить "):
-            denied = self._admin_required(user_id)
-            if denied:
-                return denied
-            tail = self._clean(text[len("[установить"):])
-            target_id = self._resolve_target_id(tail, message)
-            amount = self._extract_last_amount(tail)
-            if target_id is None or amount is None:
-                return "Формат: [установить @игрок 100 — или ответом на сообщение."
-
-            target_name = self._get_vk_name(vk, target_id)
-            target = self.get_or_create_player(target_id, target_name)
-            old_balance = target.balance
-            target.balance = max(0, amount)
-            delta = target.balance - old_balance
-            sign = "+" if delta >= 0 else ""
-            self._log(target, f"{sign}{delta} — баланс установлен администратором")
-            return f"✅ Баланс {target.name}: {target.balance} тронов."
+        for command, mode in (("[выдать ", "give"), ("[забрать ", "take"), ("[установить ", "set")):
+            if lower.startswith(command):
+                denied = self._admin_required(user_id)
+                if denied:
+                    return denied
+                tail = self._clean(text[len(command.rstrip()):])
+                target_id = self._resolve_target_id(tail, message)
+                amount = self._extract_last_amount(tail)
+                if target_id is None or amount is None:
+                    return "Укажите игрока и сумму — упоминанием или ответом на сообщение."
+                target = self.get_or_create_player(target_id, self._get_vk_name(vk, target_id))
+                if mode == "give":
+                    target.balance += amount
+                    log = f"+{amount} — выдано администратором"
+                elif mode == "take":
+                    amount = min(amount, target.balance)
+                    target.balance -= amount
+                    log = f"-{amount} — изъято администратором"
+                else:
+                    old = target.balance
+                    target.balance = max(0, amount)
+                    delta = target.balance - old
+                    log = f"{'+' if delta >= 0 else ''}{delta} — баланс установлен администратором"
+                self._save(target)
+                self._log(target, log)
+                return f"✅ Баланс {target.name}: {target.balance} тронов."
 
         if lower == "[сброс тронов":
             denied = self._admin_required(user_id)
@@ -507,29 +382,24 @@ class EconomyManager:
                 return denied
             self.players.clear()
             self.event = None
-            return (
-                "♻ Экономика полностью сброшена.\n"
-                f"Новые игроки получат по {self.starting_balance} тронов."
-            )
+            self.db.reset_all()
+            return f"♻ Экономика полностью сброшена.\nНовые игроки получат по {self.starting_balance} тронов."
 
         if lower == "[экономика":
             denied = self._admin_required(user_id)
             if denied:
                 return denied
-            total = sum(item.balance for item in self.players.values())
-            event_text = "нет"
-            if self.event:
-                event_text = (
-                    f"{self.event.title}; банк: {self.event.bank}; "
-                    f"ставки {'открыты' if self.event.bets_open else 'закрыты'}"
-                )
-            return (
-                "⚙ Экономика Кубятни\n\n"
-                f"Игроков: {len(self.players)}\n"
-                f"Стартовый баланс: {self.starting_balance}\n"
-                f"Тронов на руках: {total}\n"
-                f"Активное событие: {event_text}"
-            )
+            total = sum(x.balance for x in self.players.values())
+            event_text = "нет" if not self.event else f"{self.event.title}; банк: {self.event.bank}; ставки {'открыты' if self.event.bets_open else 'закрыты'}"
+            db_status = "подключена" if self.db.enabled else "не подключена"
+            return f"⚙ Экономика Кубятни\n\nИгроков: {len(self.players)}\nСтартовый баланс: {self.starting_balance}\nТронов на руках: {total}\nБаза данных: {db_status}\nАктивное событие: {event_text}"
+
+        if lower == "[очистить базу":
+            denied = self._admin_required(user_id)
+            if denied:
+                return denied
+            deleted = self.db.cleanup(force=True)
+            return f"🧹 Очистка завершена. Удалено старых записей истории: {deleted}. Балансы и статистика сохранены."
 
         return None
 
