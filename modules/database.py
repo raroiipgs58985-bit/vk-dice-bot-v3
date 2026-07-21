@@ -9,7 +9,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class EconomyDatabase:
@@ -65,6 +65,12 @@ class EconomyDatabase:
                 "CREATE INDEX IF NOT EXISTS economy_transactions_source_idx ON economy_transactions(source_vk_id, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS economy_transactions_target_idx ON economy_transactions(target_vk_id, created_at DESC)",
             )),
+            (4, "persistent jackpot statistics", (
+                "ALTER TABLE economy_players ADD COLUMN IF NOT EXISTS jackpot_wins BIGINT NOT NULL DEFAULT 0",
+                "ALTER TABLE economy_players ADD COLUMN IF NOT EXISTS biggest_jackpot BIGINT NOT NULL DEFAULT 0",
+                """INSERT INTO economy_state(key,value,updated_at)
+                    VALUES('jackpot','500'::jsonb,NOW()) ON CONFLICT(key) DO NOTHING""",
+            )),
         ]
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -77,9 +83,9 @@ class EconomyDatabase:
                 with conn.transaction():
                     for statement in statements:
                         cur.execute(statement)
-                    cur.execute("INSERT INTO schema_migrations (version, name) VALUES (%s, %s)", (version, name))
+                    cur.execute("INSERT INTO schema_migrations (version,name) VALUES (%s,%s)", (version, name))
                 print(f"Миграция БД {version} применена: {name}", flush=True)
-            cur.execute("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
+            cur.execute("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations")
             row = cur.fetchone()
             self.schema_version = int(row["version"] if row else 0)
         if self.schema_version != SCHEMA_VERSION:
@@ -102,22 +108,25 @@ class EconomyDatabase:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("""INSERT INTO economy_players (
                 vk_id,name,balance,last_salary_at,bets_count,wins,losses,total_bet,total_won,total_lost,
-                casino_games,casino_wins,casino_losses,casino_wagered,casino_profit,biggest_win,updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                casino_games,casino_wins,casino_losses,casino_wagered,casino_profit,biggest_win,
+                jackpot_wins,biggest_jackpot,updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                 ON CONFLICT (vk_id) DO UPDATE SET name=EXCLUDED.name,balance=EXCLUDED.balance,
                 last_salary_at=EXCLUDED.last_salary_at,bets_count=EXCLUDED.bets_count,wins=EXCLUDED.wins,
                 losses=EXCLUDED.losses,total_bet=EXCLUDED.total_bet,total_won=EXCLUDED.total_won,
                 total_lost=EXCLUDED.total_lost,casino_games=EXCLUDED.casino_games,casino_wins=EXCLUDED.casino_wins,
                 casino_losses=EXCLUDED.casino_losses,casino_wagered=EXCLUDED.casino_wagered,
-                casino_profit=EXCLUDED.casino_profit,biggest_win=EXCLUDED.biggest_win,updated_at=NOW()""",
+                casino_profit=EXCLUDED.casino_profit,biggest_win=EXCLUDED.biggest_win,
+                jackpot_wins=EXCLUDED.jackpot_wins,biggest_jackpot=EXCLUDED.biggest_jackpot,updated_at=NOW()""",
                 (player.vk_id, player.name, player.balance, player.last_salary_at, player.bets_count, player.wins,
                  player.losses, player.total_bet, player.total_won, player.total_lost, player.casino_games,
-                 player.casino_wins, player.casino_losses, player.casino_wagered, player.casino_profit, player.biggest_win))
+                 player.casino_wins, player.casino_losses, player.casino_wagered, player.casino_profit,
+                 player.biggest_win, player.jackpot_wins, player.biggest_jackpot))
 
     def add_history(self, vk_id: int, entry: str) -> None:
         if self.enabled:
             with self._connect() as conn, conn.cursor() as cur:
-                cur.execute("INSERT INTO economy_history (vk_id, entry) VALUES (%s,%s)", (vk_id, entry))
+                cur.execute("INSERT INTO economy_history(vk_id,entry) VALUES (%s,%s)", (vk_id, entry))
 
     def add_transaction(self, *, kind: str, amount: int, reason: str, actor_vk_id: int | None = None,
                         source_vk_id: int | None = None, target_vk_id: int | None = None,
@@ -128,8 +137,8 @@ class EconomyDatabase:
                 cur.execute("""INSERT INTO economy_transactions
                     (id,kind,actor_vk_id,source_vk_id,target_vk_id,amount,reason,metadata)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
-                    (tx_id, kind, actor_vk_id, source_vk_id, target_vk_id, amount, reason,
-                     json.dumps(metadata or {}, ensure_ascii=False)))
+                    (tx_id,kind,actor_vk_id,source_vk_id,target_vk_id,amount,reason,
+                     json.dumps(metadata or {},ensure_ascii=False)))
         return tx_id
 
     def get_transactions(self, vk_id: int | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -141,7 +150,7 @@ class EconomyDatabase:
             else:
                 cur.execute("""SELECT * FROM economy_transactions
                     WHERE source_vk_id=%s OR target_vk_id=%s OR actor_vk_id=%s
-                    ORDER BY created_at DESC LIMIT %s""", (vk_id, vk_id, vk_id, limit))
+                    ORDER BY created_at DESC LIMIT %s""", (vk_id,vk_id,vk_id,limit))
             return list(cur.fetchall())
 
     def get_transaction(self, tx_id: str) -> dict[str, Any] | None:
@@ -154,61 +163,73 @@ class EconomyDatabase:
     def mark_reversed(self, tx_id: str, reverse_id: str) -> None:
         if self.enabled:
             with self._connect() as conn, conn.cursor() as cur:
-                cur.execute("UPDATE economy_transactions SET reversed_by=%s WHERE id=%s", (reverse_id, tx_id))
+                cur.execute("UPDATE economy_transactions SET reversed_by=%s WHERE id=%s", (reverse_id,tx_id))
 
-    def save_event(self, event: Any | None) -> None:
+    def get_state(self, key: str, default: Any = None) -> Any:
+        if not self.enabled:
+            return default
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT value FROM economy_state WHERE key=%s", (key,))
+            row = cur.fetchone()
+            return row["value"] if row else default
+
+    def set_state(self, key: str, value: Any) -> None:
         if not self.enabled:
             return
         with self._connect() as conn, conn.cursor() as cur:
-            if event is None:
-                cur.execute("DELETE FROM economy_state WHERE key='active_event'")
-                return
-            payload = {"title": event.title, "outcomes": event.outcomes, "bets_open": event.bets_open,
-                       "bets": [{"user_id": b.user_id, "outcome": b.outcome, "amount": b.amount} for b in event.bets.values()]}
-            cur.execute("""INSERT INTO economy_state(key,value,updated_at) VALUES('active_event',%s::jsonb,NOW())
+            cur.execute("""INSERT INTO economy_state(key,value,updated_at) VALUES(%s,%s::jsonb,NOW())
                 ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()""",
-                (json.dumps(payload, ensure_ascii=False),))
+                (key,json.dumps(value,ensure_ascii=False)))
+
+    def save_event(self, event: Any | None) -> None:
+        if event is None:
+            if self.enabled:
+                with self._connect() as conn, conn.cursor() as cur:
+                    cur.execute("DELETE FROM economy_state WHERE key='active_event'")
+            return
+        payload = {"title":event.title,"outcomes":event.outcomes,"bets_open":event.bets_open,
+                   "bets":[{"user_id":b.user_id,"outcome":b.outcome,"amount":b.amount} for b in event.bets.values()]}
+        self.set_state("active_event",payload)
 
     def load_event(self) -> dict[str, Any] | None:
-        if not self.enabled:
-            return None
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT value FROM economy_state WHERE key='active_event'")
-            row = cur.fetchone()
-            return dict(row["value"]) if row else None
+        value = self.get_state("active_event")
+        return dict(value) if isinstance(value, dict) else None
 
     def reset_all(self) -> None:
         if self.enabled:
             with self._connect() as conn, conn.cursor() as cur:
                 cur.execute("TRUNCATE economy_history,economy_players,economy_transactions RESTART IDENTITY CASCADE")
                 cur.execute("DELETE FROM economy_state")
+                cur.execute("INSERT INTO economy_state(key,value) VALUES('jackpot','500'::jsonb)")
 
     def export_snapshot(self) -> dict[str, Any]:
         if not self.enabled:
-            return {"error": "database disabled"}
+            return {"error":"database disabled"}
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM economy_players ORDER BY vk_id")
             players = [dict(x) for x in cur.fetchall()]
             cur.execute("SELECT * FROM economy_transactions ORDER BY created_at DESC LIMIT 5000")
             transactions = [dict(x) for x in cur.fetchall()]
-            for collection in (players, transactions):
+            cur.execute("SELECT key,value,updated_at FROM economy_state ORDER BY key")
+            state = [dict(x) for x in cur.fetchall()]
+            for collection in (players,transactions,state):
                 for row in collection:
-                    for key, value in list(row.items()):
-                        if hasattr(value, "isoformat"):
-                            row[key] = value.isoformat()
-                        elif isinstance(value, uuid.UUID):
-                            row[key] = str(value)
-            return {"schema_version": self.schema_version, "players": players, "transactions": transactions}
+                    for key,value in list(row.items()):
+                        if hasattr(value,"isoformat"):
+                            row[key]=value.isoformat()
+                        elif isinstance(value,uuid.UUID):
+                            row[key]=str(value)
+            return {"schema_version":self.schema_version,"players":players,"transactions":transactions,"state":state}
 
     def cleanup(self, force: bool = False) -> int:
         if not self.enabled:
             return 0
-        now = time.time()
-        if not force and now - self.last_cleanup_at < 21600:
+        now=time.time()
+        if not force and now-self.last_cleanup_at<21600:
             return 0
-        self.last_cleanup_at = now
+        self.last_cleanup_at=now
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("DELETE FROM economy_history WHERE created_at < NOW()-(%s*INTERVAL '1 day')", (self.history_retention_days,))
-            deleted = cur.rowcount
+            deleted=cur.rowcount
             cur.execute("VACUUM ANALYZE economy_history")
-            return max(0, deleted)
+            return max(0,deleted)
