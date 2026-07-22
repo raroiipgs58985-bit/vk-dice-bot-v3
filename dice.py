@@ -19,6 +19,7 @@ class DiceResult:
     total: int
     modifier: int
     dice: str
+    sides: int
     comment: str
     threshold: Optional[int] = None
     outcome: Optional[str] = None
@@ -35,7 +36,6 @@ class DiceResult:
     @property
     def failures(self) -> int:
         return sum(1 for value in self.roll_outcomes if value == "failure")
-
 
 
 def _evaluate_roll(roll_value: int, threshold: int, sides: int) -> tuple[str, int, str | None]:
@@ -57,7 +57,6 @@ def _evaluate_roll(roll_value: int, threshold: int, sides: int) -> tuple[str, in
         degrees = max(1, ((roll_value - threshold) // 10) + 1)
 
     return outcome, degrees, critical
-
 
 
 def roll(command: str) -> Optional[DiceResult | str]:
@@ -137,6 +136,7 @@ def roll(command: str) -> Optional[DiceResult | str]:
         total=total,
         modifier=modifier,
         dice=dice_name,
+        sides=sides,
         comment=comment,
         threshold=threshold,
         outcome=outcome,
@@ -148,7 +148,6 @@ def roll(command: str) -> Optional[DiceResult | str]:
     )
 
 
-
 def _single_outcome_text(result: DiceResult) -> list[str]:
     if result.threshold is None or result.outcome is None or result.degrees is None:
         return []
@@ -156,9 +155,9 @@ def _single_outcome_text(result: DiceResult) -> list[str]:
     lines: list[str] = []
     value = result.rolls[0]
 
-    if result.dice.startswith("1к100") and 1 <= value <= 5:
+    if result.sides == 100 and 1 <= value <= 5:
         lines.append("💥 Критический успех!")
-    elif result.dice.startswith("1к100") and 96 <= value <= 100:
+    elif result.sides == 100 and 96 <= value <= 100:
         lines.append("☠ Критический промах!")
 
     if result.outcome == "success":
@@ -169,17 +168,15 @@ def _single_outcome_text(result: DiceResult) -> list[str]:
     return lines
 
 
-
 def _roll_marker(result: DiceResult, index: int) -> str:
     value = result.rolls[index]
     outcome = result.roll_outcomes[index]
 
-    if result.dice.startswith(f"{len(result.rolls)}к100") and 1 <= value <= 5:
+    if result.sides == 100 and 1 <= value <= 5:
         return "💥"
-    if result.dice.startswith(f"{len(result.rolls)}к100") and 96 <= value <= 100:
+    if result.sides == 100 and 96 <= value <= 100:
         return "☠"
     return "✅" if outcome == "success" else "❌"
-
 
 
 def format_single_roll(player: str, result: DiceResult, quote: str) -> str:
@@ -219,7 +216,7 @@ def format_single_roll(player: str, result: DiceResult, quote: str) -> str:
                 f"✅ Успешных бросков: {result.successes}",
                 f"❌ Провальных бросков: {result.failures}",
             ])
-            if result.dice.startswith(f"{len(result.rolls)}к100"):
+            if result.sides == 100:
                 lines.append(f"💥 Критических успехов: {result.critical_successes}")
                 lines.append(f"☠ Критических промахов: {result.critical_failures}")
 
@@ -230,7 +227,6 @@ def format_single_roll(player: str, result: DiceResult, quote: str) -> str:
     ])
 
     return "\n".join(lines)
-
 
 
 def format_multiple_rolls(
@@ -261,7 +257,7 @@ def format_multiple_rolls(
                 )
             else:
                 critical_text = ""
-                if result.dice.startswith(f"{len(result.rolls)}к100"):
+                if result.sides == 100:
                     critical_text = (
                         f", крит. успехов: {result.critical_successes}, "
                         f"крит. промахов: {result.critical_failures}"
