@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 
-VERSION = "4.7.2"
+VERSION = "4.7.3"
 BASE_DIR = Path(__file__).resolve().parent
 
 
